@@ -548,3 +548,17 @@ Possible future improvements:
 - `scan all` for a predefined target list.
 - Optional systemd service.
 - Automatic cleanup of old scan results.
+---
+# settings for segfault VPS for more secure
+`
+mkdir -p /sec/root/keys
+cat > /sec/root/keys/.env_keys <<'EOF'
+API_KEY=your_real_key
+DISCORD_WEBHOOK=your_real_webhook
+TELEGRAM_BOT_TOKEN=your_real_token
+EOF
+chmod 600 /sec/root/keys/.env_keys
+`
+
+`source /sec/root/keys/.env_keys`
+

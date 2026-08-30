@@ -20,6 +20,15 @@ DISCORD_WEBHOOK_URL="${DISCORD_WEBHOOK_URL:-}"
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
 
+# SCANNER_CMD must be set as an array in config.env, e.g.:
+#   SCANNER_CMD=(pegpon -d)
+#   SCANNER_CMD=(nuclei -target)
+#   SCANNER_CMD=(nmap -sV)
+# The target domain is appended as the final argument at run time.
+if [[ -z "${SCANNER_CMD+set}" ]] || [[ ${#SCANNER_CMD[@]} -eq 0 ]]; then
+    SCANNER_CMD=(pegpon -d)
+fi
+
 mkdir -p "$SCAN_ROOT"
 
 
@@ -50,7 +59,38 @@ Usage:
   Show help:
     $0 help
 
+Config (config.env):
+
+  SCANNER_CMD=(pegpon -d)        # array; target is appended as last arg
+  DISCORD_WEBHOOK_URL="..."      # optional
+  TELEGRAM_BOT_TOKEN="..."       # optional
+  TELEGRAM_CHAT_ID="..."         # optional
+
 EOF
+}
+
+
+# Validate domain-like input. Restrict to characters valid in a hostname
+# to prevent path traversal, argument injection, and shell metacharacter
+# abuse in any downstream scanner command.
+validate_domain() {
+    local domain="$1"
+
+    if [[ -z "$domain" ]]; then
+        echo "Error: target is required." >&2
+        exit 1
+    fi
+
+    if [[ ! "$domain" =~ ^[a-zA-Z0-9]([a-zA-Z0-9._-]{0,251}[a-zA-Z0-9])?$ ]]; then
+        echo "Error: invalid target format: '$domain'" >&2
+        echo "Allowed: letters, digits, dots, hyphens, underscores." >&2
+        exit 1
+    fi
+
+    if [[ "$domain" == *".."* ]]; then
+        echo "Error: invalid target format: '$domain'" >&2
+        exit 1
+    fi
 }
 
 
@@ -59,14 +99,29 @@ safe_target() {
 }
 
 
+# Minimal JSON string escaping: backslash, double quote, control chars.
+json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/}"
+    s="${s//$'\t'/\\t}"
+    printf '%s' "$s"
+}
+
+
 send_discord() {
     local message="$1"
 
     [[ -z "$DISCORD_WEBHOOK_URL" ]] && return 0
 
+    local escaped
+    escaped="$(json_escape "$message")"
+
     curl -fsS \
         -H "Content-Type: application/json" \
-        --data-urlencode "payload_json={\"content\":\"$message\"}" \
+        -d "{\"content\":\"$escaped\"}" \
         "$DISCORD_WEBHOOK_URL" \
         >/dev/null 2>&1 || true
 }
@@ -121,15 +176,23 @@ run_scan() {
     local log_file="$target_dir/scan.log"
     local pid_file="$target_dir/scan.pid"
     local done_file="$target_dir/scan.done"
+    local lock_file="$target_dir/.lock"
 
     mkdir -p "$target_dir"
 
-    # Save PID
+    # Hold the lock for the lifetime of the worker so a concurrent
+    # `start_scan` cannot race past the is_running check.
+    exec 200>"$lock_file"
+    if ! flock -n 200; then
+        echo "Error: could not acquire lock for $domain (already running?)" >&2
+        exit 1
+    fi
+
     echo "$$" > "$pid_file"
 
-    # Cleanup PID when worker exits
     cleanup() {
         rm -f "$pid_file"
+        flock -u 200 2>/dev/null || true
     }
 
     trap cleanup EXIT
@@ -145,6 +208,7 @@ run_scan() {
         echo "============================================================"
         echo "SCAN STARTED"
         echo "Target : $domain"
+        echo "Command: ${SCANNER_CMD[*]} $domain"
         echo "PID    : $$"
         echo "Started: $start_time"
         echo "============================================================"
@@ -154,14 +218,15 @@ run_scan() {
     notify "🚀 Scan started
 
 Target: $domain
+Scanner: ${SCANNER_CMD[0]}
 Time: $start_time
 PID: $$"
 
-    # Run scan inside target directory
     cd "$target_dir" || exit 1
 
-    # Run Pegpon
-    pegpon -d "$domain" >> "$log_file" 2>&1
+    # Run the configured scanner. Array expansion avoids word-splitting
+    # and quoting issues regardless of how many args SCANNER_CMD has.
+    "${SCANNER_CMD[@]}" "$domain" >> "$log_file" 2>&1
     local exit_code=$?
 
     local end_epoch
@@ -182,16 +247,19 @@ PID: $$"
 
     if [[ "$exit_code" -eq 0 ]]; then
 
-        echo "============================================================" >> "$log_file"
-        echo "SCAN FINISHED SUCCESSFULLY" >> "$log_file"
-        echo "Finished : $end_time" >> "$log_file"
-        echo "Duration : $duration_text" >> "$log_file"
-        echo "Exit code: 0" >> "$log_file"
-        echo "============================================================" >> "$log_file"
+        {
+            echo "============================================================"
+            echo "SCAN FINISHED SUCCESSFULLY"
+            echo "Finished : $end_time"
+            echo "Duration : $duration_text"
+            echo "Exit code: 0"
+            echo "============================================================"
+        } >> "$log_file"
 
         cat > "$done_file" <<EOF
 status=success
 target=$domain
+scanner=${SCANNER_CMD[0]}
 started=$start_time
 finished=$end_time
 duration=$duration_text
@@ -206,16 +274,19 @@ Exit code: 0"
 
     else
 
-        echo "============================================================" >> "$log_file"
-        echo "SCAN FAILED" >> "$log_file"
-        echo "Finished : $end_time" >> "$log_file"
-        echo "Duration : $duration_text" >> "$log_file"
-        echo "Exit code: $exit_code" >> "$log_file"
-        echo "============================================================" >> "$log_file"
+        {
+            echo "============================================================"
+            echo "SCAN FAILED"
+            echo "Finished : $end_time"
+            echo "Duration : $duration_text"
+            echo "Exit code: $exit_code"
+            echo "============================================================"
+        } >> "$log_file"
 
         cat > "$done_file" <<EOF
 status=failed
 target=$domain
+scanner=${SCANNER_CMD[0]}
 started=$start_time
 finished=$end_time
 duration=$duration_text
@@ -242,20 +313,31 @@ start_scan() {
 
     local domain="$1"
 
-    if [[ -z "$domain" ]]; then
-        echo "Error: domain is required."
-        exit 1
-    fi
+    validate_domain "$domain"
 
     local target
     target="$(safe_target "$domain")"
 
     local target_dir="$SCAN_ROOT/$target"
     local pid_file="$target_dir/scan.pid"
+    local lock_file="$target_dir/.lock"
 
     mkdir -p "$target_dir"
 
-    # Already running?
+    # Atomic-ish guard: try to take the lock non-blocking here too, so a
+    # second `start_scan` invoked at nearly the same instant fails fast
+    # instead of racing the worker's own flock.
+    exec 201>"$lock_file"
+    if ! flock -n 201; then
+        echo "Scan already running or starting for $domain."
+        if is_running "$pid_file"; then
+            echo "PID : $(cat "$pid_file")"
+        fi
+        echo "Logs: $target_dir/scan.log"
+        exit 0
+    fi
+    flock -u 201
+
     if is_running "$pid_file"; then
         local pid
         pid="$(cat "$pid_file")"
@@ -268,21 +350,26 @@ start_scan() {
         exit 0
     fi
 
-    # Remove stale PID
     rm -f "$pid_file"
-
-    # Remove previous done marker
     rm -f "$target_dir/scan.done"
 
     echo "Starting scan..."
-    echo "Target: $domain"
+    echo "Target : $domain"
+    echo "Scanner: ${SCANNER_CMD[*]}"
 
-    # Start detached worker
     nohup "$0" --worker "$domain" "$target_dir" \
         >/dev/null 2>&1 &
 
-    # Give the worker a moment to create PID
-    sleep 0.5
+    # Poll for PID file instead of a fixed sleep — handles slow-starting
+    # scanners without an arbitrary race window.
+    local waited=0
+    while (( waited < 50 )); do
+        if is_running "$pid_file"; then
+            break
+        fi
+        sleep 0.1
+        waited=$((waited + 1))
+    done
 
     if is_running "$pid_file"; then
 
@@ -320,6 +407,8 @@ start_scan() {
 status_scan() {
 
     local domain="$1"
+    validate_domain "$domain"
+
     local target
     target="$(safe_target "$domain")"
 
@@ -361,6 +450,7 @@ status_scan() {
 logs_scan() {
 
     local domain="$1"
+    validate_domain "$domain"
 
     local target
     target="$(safe_target "$domain")"
@@ -387,6 +477,7 @@ logs_scan() {
 stop_scan() {
 
     local domain="$1"
+    validate_domain "$domain"
 
     local target
     target="$(safe_target "$domain")"
@@ -409,12 +500,13 @@ stop_scan() {
 
     kill "$pid" 2>/dev/null || true
 
-    # Wait briefly
-    for _ in {1..10}; do
+    local waited=0
+    while (( waited < 10 )); do
         if ! kill -0 "$pid" 2>/dev/null; then
             break
         fi
         sleep 1
+        waited=$((waited + 1))
     done
 
     if kill -0 "$pid" 2>/dev/null; then
@@ -445,11 +537,12 @@ list_scans() {
 
     local found=0
 
-    for dir in "$SCAN_ROOT"/*; do
+    shopt -s nullglob
+    for dir in "$SCAN_ROOT"/*/; do
 
         [[ -d "$dir" ]] || continue
 
-        local pid_file="$dir/scan.pid"
+        local pid_file="${dir}scan.pid"
 
         if is_running "$pid_file"; then
 
@@ -464,6 +557,7 @@ list_scans() {
             printf "  %-35s PID: %s\n" "$target" "$pid"
         fi
     done
+    shopt -u nullglob
 
     if [[ "$found" -eq 0 ]]; then
         echo "  No running scans."
