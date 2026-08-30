@@ -20,6 +20,10 @@ DISCORD_WEBHOOK_URL="${DISCORD_WEBHOOK_URL:-}"
 TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}"
 TELEGRAM_CHAT_ID="${TELEGRAM_CHAT_ID:-}"
 
+# Set to "true" in config.env to zip the target's result directory and
+# send it to Discord/Telegram after each scan finishes (success or fail).
+RESULTS_ZIP="${RESULTS_ZIP:-false}"
+
 # SCANNER_CMD must be set as an array in config.env, e.g.:
 #   SCANNER_CMD=(pegpon -d)
 #   SCANNER_CMD=(nuclei -target)
@@ -65,6 +69,12 @@ Config (config.env):
   DISCORD_WEBHOOK_URL="..."      # optional
   TELEGRAM_BOT_TOKEN="..."       # optional
   TELEGRAM_CHAT_ID="..."         # optional
+  RESULTS_ZIP="true"             # optional; zips target dir, sends as
+                                  # file to Discord/Telegram after each
+                                  # scan. Requires 'zip' installed.
+                                  # Skips upload (text notice instead)
+                                  # if zip exceeds 8MB (Discord) or
+                                  # 50MB (Telegram).
 
 EOF
 }
@@ -150,6 +160,92 @@ notify() {
 }
 
 
+# Discord hard-caps webhook uploads at 8MB (higher with server boosts,
+# not assumed here). Telegram bot API caps at 50MB. Skip upload and
+# fall back to a text notice if the zip exceeds either limit.
+DISCORD_MAX_BYTES=8000000
+TELEGRAM_MAX_BYTES=50000000
+
+send_discord_file() {
+    local filepath="$1"
+    local caption="$2"
+
+    [[ -z "$DISCORD_WEBHOOK_URL" ]] && return 0
+    [[ -f "$filepath" ]] || return 0
+
+    local size
+    size="$(stat -c%s "$filepath" 2>/dev/null || stat -f%z "$filepath" 2>/dev/null || echo 0)"
+
+    if (( size > DISCORD_MAX_BYTES )); then
+        send_discord "$caption
+
+⚠️ Results zip is $((size / 1000000))MB — exceeds Discord's 8MB webhook limit. Not uploaded. Retrieve it manually from the VPS."
+        return 0
+    fi
+
+    curl -fsS \
+        -F "payload_json={\"content\":\"$(json_escape "$caption")\"}" \
+        -F "file1=@${filepath}" \
+        "$DISCORD_WEBHOOK_URL" \
+        >/dev/null 2>&1 || true
+}
+
+send_telegram_file() {
+    local filepath="$1"
+    local caption="$2"
+
+    [[ -z "$TELEGRAM_BOT_TOKEN" ]] && return 0
+    [[ -z "$TELEGRAM_CHAT_ID" ]] && return 0
+    [[ -f "$filepath" ]] || return 0
+
+    local size
+    size="$(stat -c%s "$filepath" 2>/dev/null || stat -f%z "$filepath" 2>/dev/null || echo 0)"
+
+    if (( size > TELEGRAM_MAX_BYTES )); then
+        send_telegram "$caption
+
+⚠️ Results zip is $((size / 1000000))MB — exceeds Telegram's 50MB bot upload limit. Not uploaded. Retrieve it manually from the VPS."
+        return 0
+    fi
+
+    curl -fsS \
+        -X POST \
+        "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument" \
+        -F "chat_id=${TELEGRAM_CHAT_ID}" \
+        -F "caption=${caption}" \
+        -F "document=@${filepath}" \
+        >/dev/null 2>&1 || true
+}
+
+notify_file() {
+    local filepath="$1"
+    local caption="$2"
+
+    send_discord_file "$filepath" "$caption"
+    send_telegram_file "$filepath" "$caption"
+}
+
+
+# Zips the target directory (log, done marker, and any output files the
+# scanner wrote there — the worker cd's into target_dir before running
+# the scanner, so tool output typically lands alongside scan.log).
+# Returns the zip path on stdout, or nothing if zip is unavailable/fails.
+make_results_zip() {
+    local target_dir="$1"
+    local target_name="$2"
+
+    command -v zip >/dev/null 2>&1 || return 0
+
+    local zip_path="${target_dir}/${target_name}_results.zip"
+    rm -f "$zip_path"
+
+    ( cd "$target_dir" && zip -rq "$zip_path" . -x "*.lock" -x "*.pid" ) \
+        || return 0
+
+    [[ -f "$zip_path" ]] && echo "$zip_path"
+}
+
+
 is_running() {
     local pid_file="$1"
 
@@ -172,6 +268,9 @@ run_scan() {
 
     local domain="$1"
     local target_dir="$2"
+
+    local target_name
+    target_name="$(basename "$target_dir")"
 
     local log_file="$target_dir/scan.log"
     local pid_file="$target_dir/scan.pid"
@@ -272,6 +371,16 @@ Target: $domain
 Duration: $duration_text
 Exit code: 0"
 
+        if [[ "$RESULTS_ZIP" == "true" ]]; then
+            local zip_path
+            zip_path="$(make_results_zip "$target_dir" "$target_name")"
+            if [[ -n "$zip_path" ]]; then
+                notify_file "$zip_path" "📦 Results for $domain
+Scanner: ${SCANNER_CMD[0]}
+Duration: $duration_text"
+            fi
+        fi
+
     else
 
         {
@@ -299,6 +408,28 @@ Target: $domain
 Duration: $duration_text
 Exit code: $exit_code"
 
+        if [[ "$RESULTS_ZIP" == "true" ]]; then
+            local zip_path
+            zip_path="$(make_results_zip "$target_dir" "$target_name")"
+            if [[ -n "$zip_path" ]]; then
+                notify_file "$zip_path" "📦 Log/partial results for $domain (failed)
+Scanner: ${SCANNER_CMD[0]}
+Exit code: $exit_code"
+            fi
+        fi
+
+    fi
+
+    # If the scanner printed a "SUMMARY:" block (e.g. pipeline.sh's
+    # recon summary), forward it as its own notification — separate
+    # from the plain success/fail message above, since it carries
+    # actual findings rather than just process status.
+    if grep -q "^SUMMARY:" "$log_file" 2>/dev/null; then
+        local summary_block
+        summary_block="$(awk '/^END_SUMMARY$/{exit} /^SUMMARY:/{flag=1} flag' "$log_file")"
+        notify "🎯 Findings for $domain
+
+$summary_block"
     fi
 
     return "$exit_code"
@@ -361,10 +492,17 @@ start_scan() {
         >/dev/null 2>&1 &
 
     # Poll for PID file instead of a fixed sleep — handles slow-starting
-    # scanners without an arbitrary race window.
+    # scanners without an arbitrary race window. Also stop early if a
+    # done_file appears: a scanner fast enough to finish before we ever
+    # observe it "running" (e.g. all recon tools missing, near-instant
+    # exit) still counts as started successfully, not failed.
+    local target_done_file="$target_dir/scan.done"
     local waited=0
     while (( waited < 50 )); do
         if is_running "$pid_file"; then
+            break
+        fi
+        if [[ -f "$target_done_file" ]]; then
             break
         fi
         sleep 0.1
@@ -388,6 +526,17 @@ start_scan() {
         echo
         echo "Live log:"
         echo "  $0 logs $domain"
+
+    elif [[ -f "$target_done_file" ]]; then
+
+        echo
+        echo "✅ Scan started and finished already (very fast scanner)."
+        echo
+        echo "Target : $domain"
+        echo "Log    : $target_dir/scan.log"
+        echo
+        echo "Check:"
+        echo "  $0 status $domain"
 
     else
 
